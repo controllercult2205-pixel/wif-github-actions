@@ -1,0 +1,236 @@
+# =============================================================================
+# RESOURCE PIPELINE — hio-gcp-terraform (GitHub Actions, reusable)
+#
+# Called by orchestrator.yml once per detected backend, or run by hand from
+# Actions > resource-pipeline > Run workflow.
+# Flow: WIF auth → fmt → validate → init → plan → [artifact] → [approval] → apply
+#
+# WIF values come from the orchestrator as inputs. On a manual run, blank
+# inputs fall back to the repo variables GCP_WIF_*.
+# Approval gate = GitHub Environment "gcp-resource-apply" with required reviewers.
+# =============================================================================
+name: resource-pipeline
+
+run-name: "resource · ${{ inputs.target_path }}"
+
+on:
+  workflow_call:
+    inputs:
+      target_path:         { type: string,  required: true,  description: "Terraform folder (relative to repo root)" }
+      parent_run_id:       { type: string,  required: false, default: "manual" }
+      plan_only:           { type: boolean, required: false, default: false }
+      wif_project_number:  { type: string,  required: false, default: "" }
+      wif_pool:            { type: string,  required: false, default: "" }
+      wif_provider:        { type: string,  required: false, default: "" }
+      wif_service_account: { type: string,  required: false, default: "" }
+      apply_environment:   { type: string,  required: false, default: "gcp-resource-apply" }
+      terraform_version:   { type: string,  required: false, default: "1.7.5" }
+      runner:              { type: string,  required: false, default: "ubuntu-latest" }
+
+  workflow_dispatch:
+    inputs:
+      target_path:         { type: string,  required: true,  description: "Terraform folder (relative to repo root)" }
+      plan_only:           { type: boolean, default: true,   description: "Plan only — skip apply (safe mode)" }
+      parent_run_id:       { type: string,  default: "manual" }
+      wif_project_number:  { type: string,  default: "", description: "Blank = vars.GCP_WIF_PROJECT_NUMBER" }
+      wif_pool:            { type: string,  default: "", description: "Blank = vars.GCP_WIF_POOL" }
+      wif_provider:        { type: string,  default: "", description: "Blank = vars.GCP_WIF_PROVIDER" }
+      wif_service_account: { type: string,  default: "", description: "Blank = vars.GCP_WIF_SERVICE_ACCOUNT" }
+      apply_environment:   { type: string,  default: "gcp-resource-apply" }
+      terraform_version:   { type: string,  default: "1.7.5" }
+      runner:              { type: string,  default: "ubuntu-latest" }
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TARGET_PATH:        ${{ inputs.target_path }}
+  TF_VERSION:         ${{ inputs.terraform_version || '1.7.5' }}
+  WIF_PROJECT_NUMBER: ${{ inputs.wif_project_number  || vars.GCP_WIF_PROJECT_NUMBER }}
+  WIF_POOL:           ${{ inputs.wif_pool            || vars.GCP_WIF_POOL }}
+  WIF_PROVIDER:       ${{ inputs.wif_provider        || vars.GCP_WIF_PROVIDER }}
+  WIF_SA:             ${{ inputs.wif_service_account || vars.GCP_WIF_SERVICE_ACCOUNT }}
+  TF_IN_AUTOMATION:   "true"
+  TF_INPUT:           "false"
+
+jobs:
+  # ===========================================================================
+  # STAGE 1 — Plan
+  # ===========================================================================
+  plan:
+    name: plan · ${{ inputs.target_path }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    outputs:
+      resource_name: ${{ steps.meta.outputs.resource_name }}
+      has_changes:   ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── Validate inputs ──────────────────────────────────────────────────
+      - name: 🔍 Validate inputs
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════════════════════"
+          echo "  TARGET_PATH     : '${TARGET_PATH}'"
+          echo "  PARENT_RUN_ID   : '${{ inputs.parent_run_id }}'"
+          echo "  PLAN_ONLY       : '${{ inputs.plan_only }}'"
+          echo "  WIF_PROJECT_NUM : '${WIF_PROJECT_NUMBER}'"
+          echo "  WIF_POOL        : '${WIF_POOL}'"
+          echo "  WIF_PROVIDER    : '${WIF_PROVIDER}'"
+          echo "  WIF_SA          : '${WIF_SA}'"
+          echo "════════════════════════════════════════════════════════"
+
+          [ -z "$TARGET_PATH" ] && { echo "::error::target_path is empty."; exit 1; }
+          [ -d "$GITHUB_WORKSPACE/$TARGET_PATH" ] || { echo "::error::Directory not found: $TARGET_PATH (relative to repo root, no leading slash)"; exit 1; }
+          for V in WIF_PROJECT_NUMBER WIF_POOL WIF_PROVIDER WIF_SA; do
+            [ -z "${!V}" ] && { echo "::error::$V is empty — set the input or repo variable."; exit 1; }
+          done
+
+          # Artifact names can't contain '/', so workspaces/a/b -> workspaces-a-b
+          RESOURCE_NAME="${TARGET_PATH//\//-}"
+          echo "resource_name=${RESOURCE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "RESOURCE_NAME=${RESOURCE_NAME}" >> "$GITHUB_ENV"
+          echo "OUT_DIR=${RUNNER_TEMP}/tfout"   >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/tfout"
+
+      # ── Install Terraform ────────────────────────────────────────────────
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ── WIF Authentication (exports GOOGLE_APPLICATION_CREDENTIALS) ──────
+      - name: Authenticate via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ env.WIF_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SA }}
+
+      # ── terraform fmt ────────────────────────────────────────────────────
+      - name: terraform fmt -check
+        working-directory: ${{ inputs.target_path }}
+        run: terraform fmt -check -recursive -diff
+
+      # ── terraform validate ───────────────────────────────────────────────
+      - name: terraform validate
+        working-directory: ${{ inputs.target_path }}
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      # ── terraform init (GCS backend uses the WIF credentials) ────────────
+      - name: terraform init
+        working-directory: ${{ inputs.target_path }}
+        run: terraform init -reconfigure
+
+      # ── terraform plan ───────────────────────────────────────────────────
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ inputs.target_path }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          PLAN_FILE="tfplan-${RESOURCE_NAME}"
+
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes
+          terraform plan -out="$PLAN_FILE" -lock-timeout=5m -no-color -detailed-exitcode \
+            2>&1 | tee "${OUT_DIR}/plan-output.txt"
+          RC=${PIPESTATUS[0]}
+
+          case "$RC" in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::terraform plan failed (exit $RC)"; exit "$RC" ;;
+          esac
+
+          cp "$PLAN_FILE" "${OUT_DIR}/${PLAN_FILE}"
+
+          SUMMARY=$(terraform show -no-color "$PLAN_FILE" \
+            | grep -E "^Plan:|will be created|will be destroyed|will be updated|must be replaced|No changes" || true)
+          echo "Plan summary:"; echo "$SUMMARY"
+
+          DESTROY_COUNT=$(terraform show -no-color "$PLAN_FILE" | grep -c "will be destroyed" || true)
+          if [ "$DESTROY_COUNT" -gt 0 ]; then
+            echo "::warning::⚠ $DESTROY_COUNT resource(s) will be DESTROYED in ${TARGET_PATH} — reviewer must check."
+          fi
+
+          {
+            echo "### Plan · \`${TARGET_PATH}\`"
+            echo ""
+            echo "Parent run: \`${{ inputs.parent_run_id }}\` · Plan only: \`${{ inputs.plan_only }}\`"
+            echo ""
+            echo '```'
+            echo "${SUMMARY:-No changes.}"
+            echo '```'
+            echo "<details><summary>Full plan output</summary>"
+            echo ""
+            echo '```'
+            head -c 60000 "${OUT_DIR}/plan-output.txt"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Publish plan artifact ────────────────────────────────────────────
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ steps.meta.outputs.resource_name }}
+          path: |
+            ${{ env.OUT_DIR }}/tfplan-${{ steps.meta.outputs.resource_name }}
+            ${{ env.OUT_DIR }}/plan-output.txt
+          retention-days: 7
+
+  # ===========================================================================
+  # STAGE 2 — Apply (gated by GitHub Environment approval)
+  # Skipped when plan_only = true or the plan has no changes
+  # ===========================================================================
+  apply:
+    name: apply · ${{ inputs.target_path }}
+    needs: plan
+    if: ${{ !inputs.plan_only && needs.plan.outputs.has_changes == 'true' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    environment: ${{ inputs.apply_environment || 'gcp-resource-apply' }}
+    env:
+      RESOURCE_NAME: ${{ needs.plan.outputs.resource_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ── WIF Re-authentication ────────────────────────────────────────────
+      - name: Re-authenticate via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/${{ env.WIF_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ env.WIF_POOL }}/providers/${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SA }}
+
+      # ── Download plan artifact ───────────────────────────────────────────
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.plan.outputs.resource_name }}
+          path: ${{ runner.temp }}/plan-artifact
+
+      # ── terraform init + apply ───────────────────────────────────────────
+      - name: terraform apply
+        working-directory: ${{ inputs.target_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PLAN_FILE="tfplan-${RESOURCE_NAME}"
+          cp "${RUNNER_TEMP}/plan-artifact/${PLAN_FILE}" "$PLAN_FILE"
+
+          terraform init -reconfigure
+          terraform apply -lock-timeout=5m "$PLAN_FILE"
+
+          echo "### ✓ Applied · \`${TARGET_PATH}\`" >> "$GITHUB_STEP_SUMMARY"
