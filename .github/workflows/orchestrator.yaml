@@ -1,0 +1,181 @@
+# =============================================================================
+# ORCHESTRATOR — hio-gcp-terraform (GitHub Actions)
+#
+# 1. detect   : git diff -> find every changed folder that owns a backend.tf
+# 2. resource : call resource-pipeline.yml once per backend (matrix)
+#
+# Repo/Org VARIABLES (Settings > Secrets and variables > Actions > Variables):
+#   GCP_WIF_PROJECT_NUMBER   e.g. 123456789012   (project NUMBER, not ID)
+#   GCP_WIF_POOL             e.g. wip-github-actions
+#   GCP_WIF_PROVIDER         e.g. github-my-org
+#   GCP_WIF_SERVICE_ACCOUNT  e.g. sa-github-cicd@<project-id>.iam.gserviceaccount.com
+#   DETECT_CHANGES_IN_PATH   optional, defaults to "workspaces"
+#   TF_RUNNER                optional, runner label, defaults to "ubuntu-latest"
+# =============================================================================
+name: orchestrator
+
+run-name: "orchestrator · ${{ github.event_name }} · ${{ github.ref_name }}"
+
+on:
+  push:
+    branches: [main]
+    paths: ["workspaces/**"]
+  pull_request:
+    branches: [main]
+    paths: ["workspaces/**"]
+  workflow_dispatch:
+    inputs:
+      target_paths:
+        description: "Optional: comma-separated backend folders to run (skips git diff)"
+        type: string
+        default: ""
+      plan_only:
+        description: "Plan only — skip apply"
+        type: boolean
+        default: false
+
+# Callers must grant id-token: write, otherwise the reusable workflow can't get an OIDC token.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # ===========================================================================
+  # STAGE 1 — Detect changed backends
+  # ===========================================================================
+  detect:
+    name: Detect changed backends
+    runs-on: ${{ vars.TF_RUNNER || 'ubuntu-latest' }}
+    outputs:
+      detected: ${{ steps.detect.outputs.detected }}
+      backends: ${{ steps.detect.outputs.backends }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed backends (scoped)
+        id: detect
+        shell: bash
+        env:
+          SCOPE_PATH: ${{ vars.DETECT_CHANGES_IN_PATH || 'workspaces' }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          FORCED_PATHS: ${{ inputs.target_paths }}
+        run: |
+          set -euo pipefail
+          SCOPE_PATH="${SCOPE_PATH%/}"
+          EMPTY_TREE=$(git hash-object -t tree /dev/null)
+
+          echo "════════════════════════════════════════════════════════"
+          echo "  Scope path : ${SCOPE_PATH}"
+          echo "  Event      : ${EVENT}"
+          echo "  Commit SHA : ${GITHUB_SHA}"
+          echo "  Ref        : ${GITHUB_REF}"
+          echo "════════════════════════════════════════════════════════"
+
+          DETECTED=()
+
+          if [ -n "${FORCED_PATHS:-}" ]; then
+            # ── Manual override: use the folders given in the dispatch form ──
+            echo "Manual target_paths supplied — skipping git diff."
+            IFS=',' read -ra ITEMS <<< "$FORCED_PATHS"
+            for P in "${ITEMS[@]}"; do
+              P=$(echo "$P" | xargs); P="${P%/}"
+              [ -z "$P" ] && continue
+              if [ -f "$P/backend.tf" ]; then
+                DETECTED+=("$P")
+              else
+                echo "::error::No backend.tf in '$P'"; exit 1
+              fi
+            done
+          else
+            # ── Pick the diff base ──────────────────────────────────────────
+            case "$EVENT" in
+              pull_request)
+                BASE="$PR_BASE_SHA"
+                echo "PR mode — diff base: $BASE" ;;
+              push)
+                if [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ] \
+                   && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+                  BASE="$PUSH_BEFORE"
+                  echo "Push mode — diff base (event.before): $BASE"
+                else
+                  BASE=$(git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+                  echo "Push mode — diff base (HEAD~1 fallback): $BASE"
+                fi ;;
+              *)
+                BASE=$(git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+                echo "Manual run — diff base (HEAD~1): $BASE" ;;
+            esac
+            echo ""
+
+            CHANGED_FILES=$(git diff --name-only "$BASE" HEAD -- "${SCOPE_PATH}/" \
+              | grep -E '(\.tf|\.tfvars|\.tfvars\.json|\.terraform\.lock\.hcl)$' || true)
+
+            if [ -z "$CHANGED_FILES" ]; then
+              echo "::warning::No Terraform file changes detected under '${SCOPE_PATH}/'."
+            else
+              echo "Changed Terraform files:"
+              while IFS= read -r F; do echo "  ✎ $F"; done <<< "$CHANGED_FILES"
+              echo ""
+
+              # ── Walk up from each file to the folder owning backend.tf ──
+              while IFS= read -r CHANGED_FILE; do
+                SEARCH_DIR=$(dirname "$CHANGED_FILE")
+                FOUND=false
+                while [ "$SEARCH_DIR" != "." ] && [ "$SEARCH_DIR" != "/" ]; do
+                  if [ -f "$SEARCH_DIR/backend.tf" ]; then
+                    DETECTED+=("$SEARCH_DIR"); FOUND=true; break
+                  fi
+                  SEARCH_DIR=$(dirname "$SEARCH_DIR")
+                done
+                [ "$FOUND" = "false" ] && echo "::warning::No backend.tf found walking up from: $CHANGED_FILE"
+              done <<< "$CHANGED_FILES"
+            fi
+          fi
+
+          if [ ${#DETECTED[@]} -eq 0 ]; then
+            echo "detected=false" >> "$GITHUB_OUTPUT"
+            echo "backends=[]"    >> "$GITHUB_OUTPUT"
+            echo "### No backends to run" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          JSON=$(printf '%s\n' "${DETECTED[@]}" | sort -u | jq -R . | jq -cs .)
+          echo "Backends queued:"
+          echo "$JSON" | jq -r '.[] | "  → " + .'
+
+          echo "detected=true"     >> "$GITHUB_OUTPUT"
+          echo "backends=${JSON}"  >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Backends queued"
+            echo "$JSON" | jq -r '.[] | "- `" + . + "`"'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # STAGE 2 — Dispatch: one resource-pipeline run per backend
+  # ===========================================================================
+  resource:
+    name: ${{ matrix.target_path }}
+    needs: detect
+    if: needs.detect.outputs.detected == 'true'
+    strategy:
+      fail-fast: false        # one backend failing must not cancel the others
+      max-parallel: 5
+      matrix:
+        target_path: ${{ fromJSON(needs.detect.outputs.backends) }}
+    uses: ./.github/workflows/resource-pipeline.yml
+    with:
+      target_path: ${{ matrix.target_path }}
+      parent_run_id: ${{ github.run_id }}
+      # PRs are always plan-only; push to main plans then waits for approval to apply.
+      plan_only: ${{ github.event_name == 'pull_request' || inputs.plan_only == true }}
+      wif_project_number: ${{ vars.GCP_WIF_PROJECT_NUMBER }}
+      wif_pool: ${{ vars.GCP_WIF_POOL }}
+      wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      wif_service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT }}
+      runner: ${{ vars.TF_RUNNER || 'ubuntu-latest' }}
+    secrets: inherit
