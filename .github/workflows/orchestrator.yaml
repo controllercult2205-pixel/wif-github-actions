@@ -1,10 +1,10 @@
 # =====================================================================
-# Terraform ORCHESTRATOR
-#  - detects which stack folders under workspace/ changed
-#  - PR      : plan each changed stack (read-only SA)
-#  - main    : plan + apply each changed stack (write SA)
-# Each stack is run by the reusable RESOURCE pipeline
-# (.github/workflows/terraform-resource.yml).
+# Terraform ORCHESTRATOR - decides WHAT runs, never runs terraform itself
+#  - PR   : detect changed stacks -> call the resource pipeline (mode: plan)
+#  - main : detect changed stacks -> find the PR's plan run -> call the
+#           resource pipeline (mode: apply) with that run id, so the
+#           SAVED plan is applied (no re-plan)
+# All terraform commands run in .github/workflows/terraform-resource.yaml
 # =====================================================================
 name: terraform-orchestrator
 
@@ -19,6 +19,8 @@ on:
 permissions:
   contents: read
   id-token: write # WIF token for google-github-actions/auth
+  actions: read # find the PR plan run and download its artifacts
+  pull-requests: read # find the PR behind a push to main
 
 # one run per branch at a time; never cancel a running apply on main
 concurrency:
@@ -33,7 +35,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       stacks: ${{ steps.detect.outputs.stacks }}
-      mode: ${{ steps.detect.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,10 +52,8 @@ jobs:
           set -euo pipefail
 
           if [[ "$EVENT" == "pull_request" ]]; then
-            mode=plan
             changed=$(git diff --name-only "$PR_BASE" "$PR_HEAD")
           else
-            mode=apply
             # new branch push has no "before" commit -> compare with parent
             [[ "$PUSH_BEFORE" =~ ^0+$ ]] && PUSH_BEFORE="$PUSH_AFTER~1"
             changed=$(git diff --name-only "$PUSH_BEFORE" "$PUSH_AFTER")
@@ -70,38 +69,76 @@ jobs:
           )
 
           json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' <<<"$stacks")
-          echo "Mode:   $mode"
           echo "Stacks: $json"
           echo "stacks=$json" >> "$GITHUB_OUTPUT"
-          echo "mode=$mode"   >> "$GITHUB_OUTPUT"
 
   # -------------------------------------------------------------------
-  # 2. Plan (PR) - read-only SA
+  # 2. PR: hand each changed stack to the resource pipeline (mode: plan)
   # -------------------------------------------------------------------
-  plan:
+  stack-plan:
     needs: detect
-    if: needs.detect.outputs.stacks != '[]' && needs.detect.outputs.mode == 'plan'
+    if: github.event_name == 'pull_request' && needs.detect.outputs.stacks != '[]'
     strategy:
       fail-fast: false
       matrix:
         stack: ${{ fromJSON(needs.detect.outputs.stacks) }}
-    uses: ./.github/workflows/terraform-resource.yml
+    uses: ./.github/workflows/terraform-resource.yaml
     with:
       stack_path: ${{ matrix.stack }}
       mode: plan
 
   # -------------------------------------------------------------------
-  # 3. Apply (push to main) - each changed stack plans (read SA) then
-  #    applies that saved plan (write SA)
+  # 3. main: find the successful PR run that holds the saved plans
   # -------------------------------------------------------------------
-  apply:
+  find-plan:
     needs: detect
-    if: needs.detect.outputs.stacks != '[]' && needs.detect.outputs.mode == 'apply'
+    if: github.event_name == 'push' && needs.detect.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.find.outputs.run_id }}
+    steps:
+      - id: find
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # PR that produced this commit on main
+          pr_head=$(gh api "repos/$REPO/commits/$SHA/pulls" \
+            | jq -r '[.[] | select(.merged_at != null)][0].head.sha // empty')
+          if [[ -z "$pr_head" ]]; then
+            echo "::error::$SHA was not merged through a PR, so there is no saved plan to apply. Merge changes via a PR."
+            exit 1
+          fi
+
+          # latest successful run of THIS workflow for the PR's last commit
+          wf_id=$(gh api "repos/$REPO/actions/runs/$RUN_ID" | jq -r '.workflow_id')
+          plan_run=$(gh api "repos/$REPO/actions/workflows/$wf_id/runs?event=pull_request&head_sha=$pr_head&per_page=20" \
+            | jq -r '[.workflow_runs[] | select(.conclusion == "success")][0].id // empty')
+          if [[ -z "$plan_run" ]]; then
+            echo "::error::No successful PR plan run found for commit $pr_head. Re-run the PR checks before merging."
+            exit 1
+          fi
+
+          echo "Applying saved plans from run $plan_run (PR head $pr_head)"
+          echo "run_id=$plan_run" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------
+  # 4. main: hand each changed stack to the resource pipeline
+  #    (mode: apply) - the terraform apply itself runs there
+  # -------------------------------------------------------------------
+  stack-apply:
+    needs: [detect, find-plan]
     strategy:
       fail-fast: false
       matrix:
         stack: ${{ fromJSON(needs.detect.outputs.stacks) }}
-    uses: ./.github/workflows/resource-pipeline.yaml
+    uses: ./.github/workflows/terraform-resource.yaml
     with:
       stack_path: ${{ matrix.stack }}
       mode: apply
+      plan_run_id: ${{ needs.find-plan.outputs.run_id }}
