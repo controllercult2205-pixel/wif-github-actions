@@ -1,0 +1,197 @@
+# =====================================================================
+# Terraform pipeline (single file)
+#  - detects which stack folders under workspace/ changed
+#  - PR   : plan each changed stack as terraform-plan (read-only)
+#  - main : plan as terraform-plan, then apply that saved plan as
+#           terraform-apply (write)
+# =====================================================================
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["workspace/**"]
+  push:
+    branches: [main]
+    paths: ["workspace/**"]
+
+permissions:
+  contents: read
+  id-token: write # WIF token for google-github-actions/auth
+
+# one run per branch at a time; never cancel a running apply on main
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  TF_VERSION: "1.12.2"
+  WIF_PROVIDER: projects/288387971293/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+  PLAN_SA: terraform-plan@project-e711dfa4-6d59-4e27-9cd.iam.gserviceaccount.com
+  APPLY_SA: terraform-apply@project-e711dfa4-6d59-4e27-9cd.iam.gserviceaccount.com
+
+jobs:
+  # -------------------------------------------------------------------
+  # 1. Which stacks changed?
+  # -------------------------------------------------------------------
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      stacks: ${{ steps.detect.outputs.stacks }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT" == "pull_request" ]]; then
+            changed=$(git diff --name-only "$PR_BASE" "$PR_HEAD")
+          else
+            # new branch push has no "before" commit -> compare with parent
+            [[ "$PUSH_BEFORE" =~ ^0+$ ]] && PUSH_BEFORE="$PUSH_AFTER~1"
+            changed=$(git diff --name-only "$PUSH_BEFORE" "$PUSH_AFTER")
+          fi
+
+          # stack = folder under workspace/ that contains .tf files
+          stacks=$(
+            while read -r f; do
+              [[ "$f" == workspace/* ]] || continue
+              d=$(dirname "$f")
+              compgen -G "$d/*.tf" >/dev/null && echo "$d"
+            done <<<"$changed" | sort -u
+          )
+
+          json=$(jq -R -s -c 'split("\n") | map(select(length > 0))' <<<"$stacks")
+          echo "Stacks: $json"
+          echo "stacks=$json" >> "$GITHUB_OUTPUT"
+
+  # -------------------------------------------------------------------
+  # 2. PLAN (pull request) - terraform-plan SA, read-only
+  # -------------------------------------------------------------------
+  plan:
+    name: plan (${{ matrix.stack }})
+    needs: detect
+    if: github.event_name == 'pull_request' && needs.detect.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.detect.outputs.stacks) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.PLAN_SA }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: init
+        run: terraform init -input=false
+
+      - name: validate
+        run: terraform validate -no-color
+
+      # -lock=false: the read-only SA cannot write the state lock
+      - name: plan
+        run: terraform plan -input=false -no-color -lock=false -out=tfplan
+
+      - name: summary
+        run: |
+          {
+            echo "### Terraform plan: \`${{ matrix.stack }}\`"
+            echo '```'
+            terraform show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------
+  # 3. APPLY (push to main)
+  #    plan as terraform-plan (read) -> apply the saved plan as
+  #    terraform-apply (write). Only workflows on main can use the
+  #    apply SA (WIF binding on refs/heads/main).
+  # -------------------------------------------------------------------
+  apply:
+    name: apply (${{ matrix.stack }})
+    needs: detect
+    if: github.event_name == 'push' && needs.detect.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    environment: gcp-apply # add required reviewers on it for a manual approval
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.detect.outputs.stacks) }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ---- plan with the read-only SA ----
+      - name: auth (plan SA)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.PLAN_SA }}
+
+      - name: init
+        run: terraform init -input=false
+
+      - id: plan
+        name: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode -out=tfplan
+          rc=$?
+          set -e
+          if   [[ $rc -eq 0 ]]; then echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          elif [[ $rc -eq 2 ]]; then echo "has_changes=true"  >> "$GITHUB_OUTPUT"
+          else exit $rc; fi
+
+      - name: summary
+        run: |
+          {
+            echo "### Terraform plan: \`${{ matrix.stack }}\`"
+            echo '```'
+            terraform show -no-color tfplan | tail -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- apply the same saved plan with the write SA ----
+      - name: auth (apply SA)
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.APPLY_SA }}
+
+      - name: apply
+        if: steps.plan.outputs.has_changes == 'true'
+        run: terraform apply -input=false -no-color tfplan
