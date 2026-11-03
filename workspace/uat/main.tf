@@ -1,11 +1,6 @@
 terraform {
   required_version = ">= 1.5"
 
-  backend "gcs" {
-    bucket = "lz-test-14279-tfstate"
-    prefix = "workspace/uat"
-  }
-
   required_providers {
     google = {
       source  = "hashicorp/google"
