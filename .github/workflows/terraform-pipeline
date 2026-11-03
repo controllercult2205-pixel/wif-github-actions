@@ -1,0 +1,404 @@
+Terraform · YML
+name: Terraform
+ 
+# One workflow, two triggers:
+#   pull_request -> detect dirs, Wiz gate per dir, parallel plan per dir, OPA, approvals, gate
+#   push to main -> apply the SAME saved plan files that were reviewed on the PR
+#
+# No `paths:` filter on purpose: the `terraform-gate` job must always report so it can be a
+# required check. Directory detection happens inside the workflow instead.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+ 
+concurrency:
+  group: tf-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'apply-main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel an apply
+ 
+permissions:
+  contents: read
+ 
+env:
+  TF_IN_AUTOMATION: "true"
+ 
+jobs:
+  # ---------------------------------------------------------------------------
+  # Diff check: which workspace/<dir> directories changed (PR diff, or the merged push)
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            RANGE="origin/${BASE_REF}...HEAD"
+          else
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then BEFORE="${SHA}^"; fi
+            RANGE="${BEFORE}...${SHA}"
+          fi
+          dirs=$(git diff --name-only "$RANGE" -- 'workspace/**' | awk -F/ 'NF>=3 {print $1"/"$2}' | sort -u)
+          json='[]'
+          for d in $dirs; do
+            if compgen -G "$d/*.tf" > /dev/null; then      # skip deleted dirs
+              json=$(jq -c --arg d "$d" '. + [{dir:$d, name:($d|gsub("/";"-"))}]' <<<"$json")
+            fi
+          done
+          echo "Changed Terraform directories: $json"
+          {
+            echo "matrix=$json"
+            echo "has_changes=$([ "$json" != '[]' ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+ 
+  # ---------------------------------------------------------------------------
+  # PR: wait for the Wiz connector scan of this PR and work out WHICH directories it blocks.
+  # This job does not fail because of findings; it only publishes the blocked list so each
+  # directory's plan can fail on its own. It fails only if Wiz never reports (fail closed).
+  # ---------------------------------------------------------------------------
+  wiz-wait:
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      checks: read
+    outputs:
+      blocked: ${{ steps.wiz.outputs.blocked }}
+      url: ${{ steps.wiz.outputs.url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MATRIX: ${{ needs.detect-changes.outputs.matrix }}
+      WIZ_CHECK_NAME: ${{ vars.WIZ_IAC_CHECK_NAME || 'Wiz IaC Scan' }}
+      START_TIMEOUT: 300
+      FINISH_TIMEOUT: 1000
+    steps:
+      - id: wiz
+        run: |
+          start=$SECONDS
+          while true; do
+            run=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
+              | jq -s -c --arg n "$WIZ_CHECK_NAME" \
+                '[.[].check_runs[] | select(.name==$n)] | sort_by(.started_at) | last // empty')
+            elapsed=$((SECONDS-start))
+            if [ -z "$run" ]; then
+              [ $elapsed -gt $START_TIMEOUT ] && { echo "::error::Wiz check '$WIZ_CHECK_NAME' never appeared. Is the Wiz GitHub connector installed on this repo?"; exit 1; }
+            else
+              [ "$(jq -r .status <<<"$run")" = "completed" ] && break
+              [ $elapsed -gt $FINISH_TIMEOUT ] && { echo "::error::Timed out waiting for Wiz"; exit 1; }
+            fi
+            sleep 15
+          done
+ 
+          conclusion=$(jq -r '.conclusion' <<<"$run")
+          id=$(jq -r '.id' <<<"$run")
+          url=$(jq -r '.html_url' <<<"$run")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+ 
+          if [ "$conclusion" = "success" ] || [ "$conclusion" = "neutral" ]; then
+            blocked='[]'
+          else
+            # Attribute blocking findings to directories using the check-run annotations (file paths).
+            ann=$(gh api "repos/$REPO/check-runs/$id/annotations?per_page=100" --paginate | jq -s -c 'add // []')
+            blocked=$(jq -c --argjson m "$MATRIX" '
+              . as $a | [ $m[] | .dir as $d
+                | select(any($a[]; .annotation_level=="failure" and (.path|startswith($d+"/"))))
+                | $d ]' <<<"$ann")
+            if [ "$blocked" = "[]" ]; then
+              echo "::warning::Wiz failed but findings could not be attributed to a directory; blocking all changed directories (fail closed)."
+              blocked=$(jq -c '[.[].dir]' <<<"$MATRIX")
+            fi
+          fi
+          echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Wiz IaC scan: \`$conclusion\`"
+            echo "Blocked directories: \`$blocked\`  ([findings]($url))"
+          } >> "$GITHUB_STEP_SUMMARY"
+ 
+  # ---------------------------------------------------------------------------
+  # PR: one parallel plan per changed directory. A Wiz block (or any error) fails ONLY that
+  # directory's job; siblings keep running (fail-fast: false).
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan (${{ matrix.dir }})
+    needs: [detect-changes, wiz-wait]
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write          # WIF / OIDC
+      pull-requests: write     # PR comment
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+ 
+      - name: Wiz gate (this directory only)
+        id: wiz
+        env:
+          BLOCKED: ${{ needs.wiz-wait.outputs.blocked }}
+          DIR: ${{ matrix.dir }}
+          URL: ${{ needs.wiz-wait.outputs.url }}
+        run: |
+          if jq -e --arg d "$DIR" 'any(.[]; . == $d)' <<<"$BLOCKED" > /dev/null; then
+            echo "::error::Wiz found blocking issues in $DIR. See $URL"
+            exit 1
+          fi
+          echo "Wiz: no blocking findings in $DIR"
+ 
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TF_PLAN_SA }}
+ 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ vars.TF_VERSION || '1.9.8' }}
+          terraform_wrapper: false
+ 
+      # -lockfile=readonly: apply must use the exact provider versions this plan used.
+      # Commit .terraform.lock.hcl for every directory.
+      - run: terraform init -input=false -lockfile=readonly
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform validate -no-color
+ 
+      - name: Plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan 2>&1 | tee plan-output.txt
+          terraform show -no-color tfplan > plan.txt
+          terraform show -json tfplan > plan.json
+ 
+      - name: PR comment and run summary
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v7
+        env:
+          TF_DIR: ${{ matrix.dir }}
+          WIZ_OUTCOME: ${{ steps.wiz.outcome }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+          WIZ_URL: ${{ needs.wiz-wait.outputs.url }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { TF_DIR: dir, WIZ_OUTCOME, PLAN_OUTCOME, WIZ_URL } = process.env;
+            const marker = `<!-- tf-plan:${dir} -->`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            let body, full = '';
+            if (WIZ_OUTCOME === 'failure') {
+              body = `${marker}\n### Terraform plan: \`${dir}\` ❌ blocked by Wiz\nBlocking findings in this directory: [Wiz results](${WIZ_URL}). Plan was not run.\n\n[Workflow run](${runUrl})`;
+            } else {
+              const ok = PLAN_OUTCOME === 'success';
+              const file = fs.existsSync(`${dir}/plan.txt`) ? `${dir}/plan.txt` : `${dir}/plan-output.txt`;
+              full = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '(no plan output; an earlier step failed)';
+              const plan = full.length > 60000 ? full.slice(0, 60000) + '\n... truncated, see run summary ...' : full;
+              body = `${marker}\n### Terraform plan: \`${dir}\` ${ok ? '✅' : '❌'}\n<details><summary>Show plan</summary>\n\n\`\`\`terraform\n${plan}\n\`\`\`\n</details>\n\n[Workflow run](${runUrl})`;
+            }
+            const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            const existing = comments.find(c => c.body && c.body.startsWith(marker));
+            if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            if (full) await core.summary.addHeading(`Terraform plan: ${dir}`, 3).addCodeBlock(full.slice(0, 900000), 'terraform').write();
+ 
+      # This saved plan file is exactly what the apply stage will execute after merge.
+      - name: Upload plan
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ matrix.name }}
+          path: |
+            ${{ matrix.dir }}/tfplan
+            ${{ matrix.dir }}/plan.json
+            ${{ matrix.dir }}/plan.txt
+          if-no-files-found: error
+          retention-days: 14
+ 
+  # ---------------------------------------------------------------------------
+  # PR: OPA policy over every directory's plan (runs only when ALL plans succeeded)
+  # ---------------------------------------------------------------------------
+  opa-check:
+    needs: [detect-changes, plan]
+    if: github.event_name == 'pull_request' && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      needs_approval: ${{ steps.opa.outputs.needs_approval }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ vars.OPA_VERSION || '1.4.2' }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: plan-*
+          path: plans
+      - id: opa
+        run: |
+          shopt -s nullglob
+          needs=false
+          echo "### OPA plan policy check" >> "$GITHUB_STEP_SUMMARY"
+          for d in plans/plan-*/; do
+            name=$(basename "$d")
+            reasons=$(opa eval -i "$d/plan.json" -d .github/policy -f json 'data.terraform.plan.reasons' \
+              | jq -c '.result[0].expressions[0].value // []')
+            if [ "$reasons" != "[]" ]; then
+              needs=true
+              echo "#### \`$name\` requires extra approval" >> "$GITHUB_STEP_SUMMARY"
+              jq -r '.[] | "- " + .' <<<"$reasons" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- \`$name\`: no delete/replace, within blast radius" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "needs_approval=$needs" >> "$GITHUB_OUTPUT"
+ 
+  # Extra approval only when OPA flags the plan. Environment needs required reviewers.
+  opa-approval:
+    needs: opa-check
+    if: needs.opa-check.outputs.needs_approval == 'true'
+    runs-on: ubuntu-latest
+    environment: tf-opa-approval
+    steps:
+      - run: echo "OPA-flagged plan approved."
+ 
+  # Standard approval. Reviewers read the plan in the PR comment / run summary.
+  approval:
+    needs: opa-check
+    runs-on: ubuntu-latest
+    environment: tf-plan-approval
+    steps:
+      - run: echo "Plan approved."
+ 
+  # ---------------------------------------------------------------------------
+  # PR: single REQUIRED status check. Fails if any directory's plan, OPA or approval failed.
+  # Skipped jobs (e.g. opa-approval not triggered, or no Terraform changes) count as OK.
+  # ---------------------------------------------------------------------------
+  terraform-gate:
+    name: terraform-gate
+    if: always() && github.event_name == 'pull_request'
+    needs: [detect-changes, wiz-wait, plan, opa-check, opa-approval, approval]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
+          if jq -e '[.[].result] | any(. == "failure" or . == "cancelled")' <<<"$RESULTS" > /dev/null; then
+            echo "::error::One or more directories failed Wiz/plan/OPA/approval. See the plan (<dir>) jobs."
+            exit 1
+          fi
+ 
+  # ---------------------------------------------------------------------------
+  # PUSH to main: locate the approved PR run so we can reuse its saved plans
+  # ---------------------------------------------------------------------------
+  find-plan-run:
+    needs: detect-changes
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.find.outputs.run_id }}
+      pr: ${{ steps.find.outputs.pr }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      WORKFLOW_NAME: ${{ github.workflow }}
+    steps:
+      - id: find
+        run: |
+          pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
+          [ -n "$pr" ] || { echo "::error::No PR is associated with $SHA (direct push to main?). Nothing approved to apply."; exit 1; }
+          head=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.sha')
+          # latest SUCCESSFUL PR run for that head commit = every plan, OPA check and approval passed
+          run_id=$(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request&status=success&per_page=100" \
+            | jq -r --arg n "$WORKFLOW_NAME" '[.workflow_runs[] | select(.name==$n)] | sort_by(.created_at) | last | .id // empty')
+          [ -n "$run_id" ] || { echo "::error::No successful PR run found for PR #$pr head $head. Re-run the PR workflow."; exit 1; }
+          echo "PR #$pr, plan run $run_id"
+          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+ 
+  # ---------------------------------------------------------------------------
+  # PUSH to main: apply the saved, approved plan for each directory (never from a PR)
+  # ---------------------------------------------------------------------------
+  apply:
+    name: apply (${{ matrix.dir }})
+    needs: [detect-changes, find-plan-run]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: tf-apply
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+      actions: read            # download artifacts from the PR run
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+ 
+      # Safety: what is on main for this directory must be identical to what was planned on the PR.
+      - name: Verify merged code equals planned code
+        working-directory: .
+        env:
+          PR: ${{ needs.find-plan-run.outputs.pr }}
+          DIR: ${{ matrix.dir }}
+          SHARED: ${{ vars.TF_SHARED_PATHS }}     # optional, e.g. "modules"
+        run: |
+          git fetch origin "refs/pull/${PR}/head"
+          # shellcheck disable=SC2086
+          if ! git diff --quiet FETCH_HEAD HEAD -- "$DIR" $SHARED; then
+            echo "::error::Code on main differs from the reviewed PR head for $DIR (branch was not up to date at merge). Open a new PR so it is re-planned and re-approved."
+            exit 1
+          fi
+ 
+      - name: Download the approved plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan-${{ matrix.name }}
+          path: ${{ matrix.dir }}
+          run-id: ${{ needs.find-plan-run.outputs.run_id }}
+          github-token: ${{ github.token }}
+ 
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_TF_APPLY_SA }}
+ 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ vars.TF_VERSION || '1.9.8' }}
+          terraform_wrapper: false
+ 
+      - run: terraform init -input=false -lockfile=readonly
+ 
+      # Applies exactly the saved plan. Terraform refuses it if state changed since planning.
+      - name: Apply saved plan
+        run: terraform apply -input=false -lock-timeout=5m -no-color tfplan
+ 
