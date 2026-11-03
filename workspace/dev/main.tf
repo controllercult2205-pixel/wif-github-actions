@@ -20,7 +20,7 @@ provider "google" {
   region  = var.region
 }
 
-resource "google_storage_bucket" "demo" {
+resource "google_storage_bucket" "demo1" {
   name                        = "${var.project_id}-demo-bucket"
   location                    = var.region
   uniform_bucket_level_access = true
