@@ -26,9 +26,9 @@ concurrency:
 
 env:
   TF_VERSION: "1.12.2"
-  WIF_PROVIDER: projects/771107223926/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider
-  PLAN_SA: terraform-plan@uom-cicd.iam.gserviceaccount.com
-  APPLY_SA: terraform-apply@uom-cicd.iam.gserviceaccount.com
+  WIF_PROVIDER: projects/288387971293/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+  PLAN_SA: terraform-plan@project-e711dfa4-6d59-4e27-9cd.iam.gserviceaccount.com
+  APPLY_SA: terraform-apply@project-e711dfa4-6d59-4e27-9cd.iam.gserviceaccount.com
 
 jobs:
   # -------------------------------------------------------------------
