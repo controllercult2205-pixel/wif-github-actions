@@ -101,7 +101,7 @@ jobs:
       fail-fast: false
       matrix:
         stack: ${{ fromJSON(needs.detect.outputs.stacks) }}
-    uses: ./.github/workflows/terraform-resource.yml
+    uses: ./.github/workflows/resource-pipeline.yaml
     with:
       stack_path: ${{ matrix.stack }}
       mode: apply
