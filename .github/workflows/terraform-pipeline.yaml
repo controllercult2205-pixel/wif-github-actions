@@ -12,6 +12,10 @@ name: Terraform
 #   pull_request -> detect, Wiz gate, plan per backend, OPA, approvals, terraform-gate
 #   push to main -> apply the SAME saved plan files that were reviewed on the PR
 #
+# Wiz and OPA are switched on with repo variables (off when not set):
+#   ENABLE_WIZ = true  -> wiz-wait + per-backend Wiz gate
+#   ENABLE_OPA = true  -> opa-check + opa-approval (when flagged)
+#
 # No `paths:` filter on purpose: `terraform-gate` must always report so it can be
 # a required check. Backend detection happens inside the workflow instead.
 # =============================================================================
@@ -99,7 +103,7 @@ jobs:
   # ===========================================================================
   wiz-wait:
     needs: detect-changes
-    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
+    if: vars.ENABLE_WIZ == 'true' && github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -165,7 +169,11 @@ jobs:
   plan:
     name: plan (${{ matrix.dir }})
     needs: [detect-changes, wiz-wait]
-    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
+    # runs when wiz-wait succeeded OR was skipped (Wiz disabled)
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      needs.detect-changes.outputs.has_changes == 'true' &&
+      (needs.wiz-wait.result == 'success' || needs.wiz-wait.result == 'skipped')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -192,6 +200,7 @@ jobs:
 
       - name: Wiz gate (this backend only)
         id: wiz
+        if: vars.ENABLE_WIZ == 'true'
         env:
           BLOCKED: ${{ needs.wiz-wait.outputs.blocked }}
           DIR: ${{ matrix.dir }}
@@ -292,7 +301,7 @@ jobs:
   # ===========================================================================
   opa-check:
     needs: [detect-changes, plan]
-    if: github.event_name == 'pull_request' && needs.plan.result == 'success'
+    if: vars.ENABLE_OPA == 'true' && github.event_name == 'pull_request' && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     outputs:
       needs_approval: ${{ steps.opa.outputs.needs_approval }}
@@ -335,7 +344,12 @@ jobs:
 
   # Standard approval. Reviewers read the plan in the PR comment / run summary.
   approval:
-    needs: opa-check
+    needs: [plan, opa-check]
+    # runs when all plans succeeded and OPA succeeded OR was skipped (OPA disabled)
+    if: >-
+      !cancelled() && github.event_name == 'pull_request' &&
+      needs.plan.result == 'success' &&
+      (needs.opa-check.result == 'success' || needs.opa-check.result == 'skipped')
     runs-on: ubuntu-latest
     environment: tf-plan-approval
     steps:
