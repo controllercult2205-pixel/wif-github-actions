@@ -1,4 +1,4 @@
-name: Terraform
+  name: Terraform
 
 # =============================================================================
 # SINGLE PIPELINE - same logic as the ADO orchestrator + resource pipelines.
@@ -42,7 +42,7 @@ jobs:
       matrix: ${{ steps.detect.outputs.matrix }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: detect
@@ -92,7 +92,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate inputs
         working-directory: .
@@ -103,7 +103,7 @@ jobs:
           compgen -G "$DIR/*.tf" > /dev/null || { echo "::error::No .tf files in $DIR"; exit 1; }
           echo "Directory: $DIR"
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ vars.TF_VERSION || '1.12.2' }}
           terraform_wrapper: false
@@ -117,7 +117,7 @@ jobs:
           terraform validate -no-color
 
       - name: Authenticate via Workload Identity Federation (plan SA)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_TF_PLAN_SA }}
@@ -146,7 +146,7 @@ jobs:
 
       - name: PR comment and run summary
         if: ${{ !cancelled() }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TF_DIR: ${{ matrix.dir }}
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
@@ -170,7 +170,7 @@ jobs:
       # Publish plan artifact: this saved plan is exactly what apply executes after merge.
       - name: Publish plan artifact
         if: steps.plan.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: plan-${{ matrix.name }}
           path: |
@@ -264,7 +264,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -284,20 +284,20 @@ jobs:
           fi
 
       - name: Download plan artifact (from the approved PR run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: plan-${{ matrix.name }}
           path: ${{ matrix.dir }}
           run-id: ${{ needs.find-plan-run.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ vars.TF_VERSION || '1.12.2' }}
           terraform_wrapper: false
 
       - name: Authenticate via Workload Identity Federation (apply SA)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_TF_APPLY_SA }}
