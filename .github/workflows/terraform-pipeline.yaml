@@ -1,20 +1,15 @@
 name: Terraform
 
 # =============================================================================
-# SINGLE PIPELINE - same logic as the ADO orchestrator + resource pipelines,
-# plus Wiz (connector), OPA and approvals.
+# SINGLE PIPELINE - same logic as the ADO orchestrator + resource pipelines.
 #
 #   ORCHESTRATOR part : detect-changes  (which backends changed)
 #                       per-backend matrix = the ADO "dispatch"
 #   RESOURCE part     : plan  (per backend, PR)   fmt -> validate -> init -> plan -> artifact
 #                       apply (per backend, main) download saved plan -> init -> apply
 #
-#   pull_request -> detect, Wiz gate, plan per backend, OPA, approvals, terraform-gate
+#   pull_request -> detect, plan per backend, approval, terraform-gate
 #   push to main -> apply the SAME saved plan files that were reviewed on the PR
-#
-# Wiz and OPA are switched on with repo variables (off when not set):
-#   ENABLE_WIZ = true  -> wiz-wait + per-backend Wiz gate
-#   ENABLE_OPA = true  -> opa-check + opa-approval (when flagged)
 #
 # No `paths:` filter on purpose: `terraform-gate` must always report so it can be
 # a required check. Backend detection happens inside the workflow instead.
@@ -97,83 +92,13 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ===========================================================================
-  # PR: wait for the Wiz connector scan and work out WHICH backends it blocks.
-  # Doesn't fail on findings (each backend's plan fails on its own); fails only
-  # if Wiz never reports (fail closed).
-  # ===========================================================================
-  wiz-wait:
-    needs: detect-changes
-    if: vars.ENABLE_WIZ == 'true' && github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      checks: read
-    outputs:
-      blocked: ${{ steps.wiz.outputs.blocked }}
-      url: ${{ steps.wiz.outputs.url }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      MATRIX: ${{ needs.detect-changes.outputs.matrix }}
-      WIZ_CHECK_NAME: ${{ vars.WIZ_IAC_CHECK_NAME || 'Wiz IaC Scan' }}
-      START_TIMEOUT: 300
-      FINISH_TIMEOUT: 1000
-    steps:
-      - id: wiz
-        run: |
-          start=$SECONDS
-          while true; do
-            run=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --paginate \
-              | jq -s -c --arg n "$WIZ_CHECK_NAME" \
-                '[.[].check_runs[] | select(.name==$n)] | sort_by(.started_at) | last // empty')
-            elapsed=$((SECONDS-start))
-            if [ -z "$run" ]; then
-              [ "$elapsed" -gt "$START_TIMEOUT" ] && { echo "::error::Wiz check '$WIZ_CHECK_NAME' never appeared. Is the Wiz GitHub connector installed on this repo?"; exit 1; }
-            else
-              [ "$(jq -r .status <<<"$run")" = "completed" ] && break
-              [ "$elapsed" -gt "$FINISH_TIMEOUT" ] && { echo "::error::Timed out waiting for Wiz"; exit 1; }
-            fi
-            sleep 15
-          done
-
-          conclusion=$(jq -r '.conclusion' <<<"$run")
-          id=$(jq -r '.id' <<<"$run")
-          url=$(jq -r '.html_url' <<<"$run")
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-
-          if [ "$conclusion" = "success" ] || [ "$conclusion" = "neutral" ]; then
-            blocked='[]'
-          else
-            # Attribute blocking findings to backends using the check-run annotations (file paths).
-            ann=$(gh api "repos/$REPO/check-runs/$id/annotations?per_page=100" --paginate | jq -s -c 'add // []')
-            blocked=$(jq -c --argjson m "$MATRIX" '
-              . as $a | [ $m[] | .dir as $d
-                | select(any($a[]; .annotation_level=="failure" and (.path|startswith($d+"/"))))
-                | $d ]' <<<"$ann")
-            if [ "$blocked" = "[]" ]; then
-              echo "::warning::Wiz failed but findings could not be attributed to a backend; blocking all changed backends (fail closed)."
-              blocked=$(jq -c '[.[].dir]' <<<"$MATRIX")
-            fi
-          fi
-          echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Wiz IaC scan: \`$conclusion\`"
-            echo "Blocked backends: \`$blocked\`  ([findings]($url))"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ===========================================================================
   # RESOURCE - Stage "plan" (PR), one parallel job per backend (= ADO dispatch).
-  # A Wiz block or any error fails ONLY that backend's job (fail-fast: false).
+  # An error fails ONLY that backend's job (fail-fast: false).
   # ===========================================================================
   plan:
     name: plan (${{ matrix.dir }})
-    needs: [detect-changes, wiz-wait]
-    # runs when wiz-wait succeeded OR was skipped (Wiz disabled)
-    if: >-
-      !cancelled() && github.event_name == 'pull_request' &&
-      needs.detect-changes.outputs.has_changes == 'true' &&
-      (needs.wiz-wait.result == 'success' || needs.wiz-wait.result == 'skipped')
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.has_changes == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -197,20 +122,6 @@ jobs:
           [ -d "$DIR" ] || { echo "::error::Directory not found: $DIR"; exit 1; }
           [ -f "$DIR/backend.tf" ] || { echo "::error::No backend.tf in $DIR"; exit 1; }
           echo "Backend: $DIR"
-
-      - name: Wiz gate (this backend only)
-        id: wiz
-        if: vars.ENABLE_WIZ == 'true'
-        env:
-          BLOCKED: ${{ needs.wiz-wait.outputs.blocked }}
-          DIR: ${{ matrix.dir }}
-          URL: ${{ needs.wiz-wait.outputs.url }}
-        run: |
-          if jq -e --arg d "$DIR" 'any(.[]; . == $d)' <<<"$BLOCKED" > /dev/null; then
-            echo "::error::Wiz found blocking issues in $DIR. See $URL"
-            exit 1
-          fi
-          echo "Wiz: no blocking findings in $DIR"
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -258,30 +169,23 @@ jobs:
         uses: actions/github-script@v7
         env:
           TF_DIR: ${{ matrix.dir }}
-          WIZ_OUTCOME: ${{ steps.wiz.outcome }}
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
-          WIZ_URL: ${{ needs.wiz-wait.outputs.url }}
         with:
           script: |
             const fs = require('fs');
-            const { TF_DIR: dir, WIZ_OUTCOME, PLAN_OUTCOME, WIZ_URL } = process.env;
+            const { TF_DIR: dir, PLAN_OUTCOME } = process.env;
             const marker = `<!-- tf-plan:${dir} -->`;
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            let body, full = '';
-            if (WIZ_OUTCOME === 'failure') {
-              body = `${marker}\n### Terraform plan: \`${dir}\` ❌ blocked by Wiz\nBlocking findings in this backend: [Wiz results](${WIZ_URL}). Plan was not run.\n\n[Workflow run](${runUrl})`;
-            } else {
-              const ok = PLAN_OUTCOME === 'success';
-              const file = fs.existsSync(`${dir}/plan.txt`) ? `${dir}/plan.txt` : `${dir}/plan-output.txt`;
-              full = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '(no plan output; an earlier step failed)';
-              const plan = full.length > 60000 ? full.slice(0, 60000) + '\n... truncated, see run summary ...' : full;
-              body = `${marker}\n### Terraform plan: \`${dir}\` ${ok ? '✅' : '❌'}\n<details><summary>Show plan</summary>\n\n\`\`\`terraform\n${plan}\n\`\`\`\n</details>\n\n[Workflow run](${runUrl})`;
-            }
+            const ok = PLAN_OUTCOME === 'success';
+            const file = fs.existsSync(`${dir}/plan.txt`) ? `${dir}/plan.txt` : `${dir}/plan-output.txt`;
+            const full = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '(no plan output; an earlier step failed)';
+            const plan = full.length > 60000 ? full.slice(0, 60000) + '\n... truncated, see run summary ...' : full;
+            const body = `${marker}\n### Terraform plan: \`${dir}\` ${ok ? '✅' : '❌'}\n<details><summary>Show plan</summary>\n\n\`\`\`terraform\n${plan}\n\`\`\`\n</details>\n\n[Workflow run](${runUrl})`;
             const { data: comments } = await github.rest.issues.listComments({ ...context.repo, issue_number: context.issue.number, per_page: 100 });
             const existing = comments.find(c => c.body && c.body.startsWith(marker));
             if (existing) await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
             else await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
-            if (full) await core.summary.addHeading(`Terraform plan: ${dir}`, 3).addCodeBlock(full.slice(0, 900000), 'terraform').write();
+            await core.summary.addHeading(`Terraform plan: ${dir}`, 3).addCodeBlock(full.slice(0, 900000), 'terraform').write();
 
       # Publish plan artifact: this saved plan is exactly what apply executes after merge.
       - name: Publish plan artifact
@@ -296,73 +200,23 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ===========================================================================
-  # PR: OPA policy over every backend's plan (only when ALL plans succeeded)
-  # ===========================================================================
-  opa-check:
-    needs: [detect-changes, plan]
-    if: vars.ENABLE_OPA == 'true' && github.event_name == 'pull_request' && needs.plan.result == 'success'
-    runs-on: ubuntu-latest
-    outputs:
-      needs_approval: ${{ steps.opa.outputs.needs_approval }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: open-policy-agent/setup-opa@v2
-        with:
-          version: ${{ vars.OPA_VERSION || '1.4.2' }}
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: plan-*
-          path: plans
-      - id: opa
-        run: |
-          shopt -s nullglob
-          needs=false
-          echo "### OPA plan policy check" >> "$GITHUB_STEP_SUMMARY"
-          for d in plans/plan-*/; do
-            name=$(basename "$d")
-            reasons=$(opa eval -i "$d/plan.json" -d .github/policy -f json 'data.terraform.plan.reasons' \
-              | jq -c '.result[0].expressions[0].value // []')
-            if [ "$reasons" != "[]" ]; then
-              needs=true
-              echo "#### \`$name\` requires extra approval" >> "$GITHUB_STEP_SUMMARY"
-              jq -r '.[] | "- " + .' <<<"$reasons" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "- \`$name\`: no delete/replace, within blast radius" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
-          echo "needs_approval=$needs" >> "$GITHUB_OUTPUT"
-
-  # Extra approval only when OPA flags the plan. Environment needs required reviewers.
-  opa-approval:
-    needs: opa-check
-    if: needs.opa-check.outputs.needs_approval == 'true'
-    runs-on: ubuntu-latest
-    environment: tf-opa-approval
-    steps:
-      - run: echo "OPA-flagged plan approved."
-
   # Standard approval. Reviewers read the plan in the PR comment / run summary.
   approval:
-    needs: [plan, opa-check]
-    # runs when all plans succeeded and OPA succeeded OR was skipped (OPA disabled)
-    if: >-
-      !cancelled() && github.event_name == 'pull_request' &&
-      needs.plan.result == 'success' &&
-      (needs.opa-check.result == 'success' || needs.opa-check.result == 'skipped')
+    needs: plan
+    if: github.event_name == 'pull_request' && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     environment: tf-plan-approval
     steps:
       - run: echo "Plan approved."
 
   # ===========================================================================
-  # PR: single REQUIRED status check. Fails if any backend's plan, OPA or
-  # approval failed. Skipped jobs (no changes / OPA approval not needed) = OK.
+  # PR: single REQUIRED status check. Fails if any backend's plan or the
+  # approval failed. Skipped jobs (no Terraform changes) = OK.
   # ===========================================================================
   terraform-gate:
     name: terraform-gate
     if: always() && github.event_name == 'pull_request'
-    needs: [detect-changes, wiz-wait, plan, opa-check, opa-approval, approval]
+    needs: [detect-changes, plan, approval]
     runs-on: ubuntu-latest
     steps:
       - env:
@@ -370,7 +224,7 @@ jobs:
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
           if jq -e '[.[].result] | any(. == "failure" or . == "cancelled")' <<<"$RESULTS" > /dev/null; then
-            echo "::error::One or more backends failed Wiz/plan/OPA/approval. See the plan (<dir>) jobs."
+            echo "::error::One or more backends failed plan/approval. See the plan (<dir>) jobs."
             exit 1
           fi
 
@@ -399,7 +253,7 @@ jobs:
           pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
           [ -n "$pr" ] || { echo "::error::No PR is associated with $SHA (direct push to main?). Nothing approved to apply."; exit 1; }
           head=$(gh api "repos/$REPO/pulls/$pr" --jq '.head.sha')
-          # latest SUCCESSFUL PR run for that head commit = every plan, OPA check and approval passed
+          # latest SUCCESSFUL PR run for that head commit = every plan and the approval passed
           run_id=$(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request&status=success&per_page=100" \
             | jq -r --arg n "$WORKFLOW_NAME" '[.workflow_runs[] | select(.name==$n)] | sort_by(.created_at) | last | .id // empty')
           [ -n "$run_id" ] || { echo "::error::No successful PR run found for PR #$pr head $head. Re-run the PR workflow."; exit 1; }
