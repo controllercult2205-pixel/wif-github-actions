@@ -1,4 +1,4 @@
-  name: Terraform
+name: Terraform
 
 # =============================================================================
 # SINGLE PIPELINE - same logic as the ADO orchestrator + resource pipelines.
