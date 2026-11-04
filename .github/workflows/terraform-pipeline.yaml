@@ -1,18 +1,18 @@
-name: Terraform
+  name: Terraform
 
 # =============================================================================
 # SINGLE PIPELINE - same logic as the ADO orchestrator + resource pipelines.
 #
-#   ORCHESTRATOR part : detect-changes  (which backends changed)
-#                       per-backend matrix = the ADO "dispatch"
-#   RESOURCE part     : plan  (per backend, PR)   fmt -> validate -> init -> plan -> artifact
-#                       apply (per backend, main) download saved plan -> init -> apply
+#   ORCHESTRATOR part : detect-changes  (which workspace/<dir> folders changed)
+#                       per-directory matrix = the ADO "dispatch"
+#   RESOURCE part     : plan  (per dir, PR)   fmt -> validate -> init -> plan -> artifact
+#                       apply (per dir, main) download saved plan -> init -> apply
 #
-#   pull_request -> detect, plan per backend, approval, terraform-gate
+#   pull_request -> detect, plan per directory, approval, terraform-gate
 #   push to main -> apply the SAME saved plan files that were reviewed on the PR
 #
 # No `paths:` filter on purpose: `terraform-gate` must always report so it can be
-# a required check. Backend detection happens inside the workflow instead.
+# a required check. Directory detection happens inside the workflow instead.
 # =============================================================================
 on:
   pull_request:
@@ -32,9 +32,9 @@ env:
 
 jobs:
   # ===========================================================================
-  # ORCHESTRATOR - Stage 1: detect changed backends
-  #   changed .tf/.tfvars files under the scope path -> walk up to the nearest
-  #   folder with backend.tf -> one matrix entry per backend
+  # ORCHESTRATOR - Stage 1: detect changed directories
+  #   any changed file under workspace/<dir>/... -> workspace/<dir>
+  #   (kept only if that folder still has .tf files) -> one matrix entry per dir
   # ===========================================================================
   detect-changes:
     runs-on: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
       matrix: ${{ steps.detect.outputs.matrix }}
       has_changes: ${{ steps.detect.outputs.has_changes }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: detect
@@ -51,49 +51,29 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           BEFORE: ${{ github.event.before }}
           SHA: ${{ github.sha }}
-          SCOPE_PATH: ${{ vars.TF_SCOPE_PATH || 'workspace' }}   # = detect_changes_in_path in ADO
         run: |
-          set -euo pipefail
-          SCOPE_PATH="${SCOPE_PATH%/}"
-
           if [ "$EVENT" = "pull_request" ]; then
-            BASE=$(git merge-base HEAD "origin/${BASE_REF}")
+            RANGE="origin/${BASE_REF}...HEAD"
           else
             if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then BEFORE="${SHA}^"; fi
-            BASE="$BEFORE"
+            RANGE="${BEFORE}...${SHA}"
           fi
-          echo "Scope: ${SCOPE_PATH}/   Diff base: $BASE"
-
-          CHANGED_FILES=$(git diff --name-only "$BASE" HEAD -- "${SCOPE_PATH}/" \
-            | grep -E '\.(tf|tfvars|tfvars\.json)$' || true)
-          echo "Changed Terraform files:"; echo "${CHANGED_FILES:-  (none)}"
-
-          dirs=$(
-            while IFS= read -r f; do
-              [ -z "$f" ] && continue
-              d=$(dirname "$f")
-              found=false
-              while [ "$d" != "." ] && [ "$d" != "/" ]; do
-                if [ -f "$d/backend.tf" ]; then echo "$d"; found=true; break; fi
-                d=$(dirname "$d")
-              done
-              if [ "$found" = false ]; then echo "::warning::No backend.tf found walking up from $f" >&2; fi
-            done <<<"$CHANGED_FILES" | sort -u
-          )
-
+          dirs=$(git diff --name-only "$RANGE" -- 'workspace/**' | awk -F/ 'NF>=3 {print $1"/"$2}' | sort -u)
           json='[]'
           for d in $dirs; do
-            json=$(jq -c --arg d "$d" '. + [{dir:$d, name:($d|gsub("/";"-"))}]' <<<"$json")
+            if compgen -G "$d/*.tf" > /dev/null; then      # skip deleted dirs
+              json=$(jq -c --arg d "$d" '. + [{dir:$d, name:($d|gsub("/";"-"))}]' <<<"$json")
+            fi
           done
-          echo "Backends queued: $json"
+          echo "Changed Terraform directories: $json"
           {
             echo "matrix=$json"
             echo "has_changes=$([ "$json" != '[]' ] && echo true || echo false)"
           } >> "$GITHUB_OUTPUT"
 
   # ===========================================================================
-  # RESOURCE - Stage "plan" (PR), one parallel job per backend (= ADO dispatch).
-  # An error fails ONLY that backend's job (fail-fast: false).
+  # RESOURCE - Stage "plan" (PR), one parallel job per directory (= ADO dispatch).
+  # An error fails ONLY that directory's job (fail-fast: false).
   # ===========================================================================
   plan:
     name: plan (${{ matrix.dir }})
@@ -112,7 +92,7 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate inputs
         working-directory: .
@@ -120,10 +100,10 @@ jobs:
           DIR: ${{ matrix.dir }}
         run: |
           [ -d "$DIR" ] || { echo "::error::Directory not found: $DIR"; exit 1; }
-          [ -f "$DIR/backend.tf" ] || { echo "::error::No backend.tf in $DIR"; exit 1; }
-          echo "Backend: $DIR"
+          compgen -G "$DIR/*.tf" > /dev/null || { echo "::error::No .tf files in $DIR"; exit 1; }
+          echo "Directory: $DIR"
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ vars.TF_VERSION || '1.12.2' }}
           terraform_wrapper: false
@@ -137,13 +117,13 @@ jobs:
           terraform validate -no-color
 
       - name: Authenticate via Workload Identity Federation (plan SA)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_TF_PLAN_SA }}
 
       # -lockfile=readonly: apply must use the exact provider versions this plan used.
-      # Commit .terraform.lock.hcl for every backend.
+      # Commit .terraform.lock.hcl for every directory.
       - name: terraform init
         run: terraform init -input=false -reconfigure -lockfile=readonly
 
@@ -166,7 +146,7 @@ jobs:
 
       - name: PR comment and run summary
         if: ${{ !cancelled() }}
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           TF_DIR: ${{ matrix.dir }}
           PLAN_OUTCOME: ${{ steps.plan.outcome }}
@@ -190,7 +170,7 @@ jobs:
       # Publish plan artifact: this saved plan is exactly what apply executes after merge.
       - name: Publish plan artifact
         if: steps.plan.outcome == 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: plan-${{ matrix.name }}
           path: |
@@ -210,7 +190,7 @@ jobs:
       - run: echo "Plan approved."
 
   # ===========================================================================
-  # PR: single REQUIRED status check. Fails if any backend's plan or the
+  # PR: single REQUIRED status check. Fails if any directory's plan or the
   # approval failed. Skipped jobs (no Terraform changes) = OK.
   # ===========================================================================
   terraform-gate:
@@ -224,7 +204,7 @@ jobs:
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$RESULTS"
           if jq -e '[.[].result] | any(. == "failure" or . == "cancelled")' <<<"$RESULTS" > /dev/null; then
-            echo "::error::One or more backends failed plan/approval. See the plan (<dir>) jobs."
+            echo "::error::One or more directories failed plan/approval. See the plan (<dir>) jobs."
             exit 1
           fi
 
@@ -262,7 +242,7 @@ jobs:
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
 
   # ===========================================================================
-  # RESOURCE - Stage "apply" (push to main), one backend at a time.
+  # RESOURCE - Stage "apply" (push to main), one directory at a time.
   # Applies the saved, approved plan from the PR run (never a new plan).
   # ===========================================================================
   apply:
@@ -284,11 +264,11 @@ jobs:
       run:
         working-directory: ${{ matrix.dir }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      # Safety: what is on main for this backend must be identical to what was planned on the PR.
+      # Safety: what is on main for this directory must be identical to what was planned on the PR.
       - name: Verify merged code equals planned code
         working-directory: .
         env:
@@ -304,20 +284,20 @@ jobs:
           fi
 
       - name: Download plan artifact (from the approved PR run)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: plan-${{ matrix.name }}
           path: ${{ matrix.dir }}
           run-id: ${{ needs.find-plan-run.outputs.run_id }}
           github-token: ${{ github.token }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ vars.TF_VERSION || '1.12.2' }}
           terraform_wrapper: false
 
       - name: Authenticate via Workload Identity Federation (apply SA)
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_TF_APPLY_SA }}
